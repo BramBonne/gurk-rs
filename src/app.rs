@@ -16,6 +16,7 @@ use presage::prelude::{
     Content, GroupMasterKey, GroupSecretParams, ServiceAddress,
 };
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc::Sender;
 use unicode_width::UnicodeWidthStr;
 use uuid::Uuid;
 
@@ -29,6 +30,7 @@ pub struct App {
     pub config: Config,
     pub should_quit: bool,
     pub signal_manager: signal::Manager,
+    pub event_channel: Sender<Event>,
     pub data: AppData,
 }
 
@@ -154,7 +156,7 @@ impl Channel {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ChannelId {
     User(Uuid),
     Group(GroupIdentifierBytes),
@@ -179,11 +181,20 @@ impl ChannelId {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub enum DeliveryStatus {
+    SENT,
+    DELIVERED,
+    RECEIVED,
+    FAILED,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Message {
     pub from_id: Uuid,
     pub message: Option<String>,
     pub arrived_at: u64,
+    pub status: DeliveryStatus,
     #[serde(default)]
     pub quote: Option<Box<Message>>,
     #[serde(default)]
@@ -193,11 +204,12 @@ pub struct Message {
 }
 
 impl Message {
-    fn new(from_id: Uuid, message: String, arrived_at: u64) -> Self {
+    fn new_received(from_id: Uuid, message: String, arrived_at: u64) -> Self {
         Self {
             from_id,
             message: Some(message),
             arrived_at,
+            status: DeliveryStatus::RECEIVED,
             quote: None,
             attachments: Default::default(),
             reactions: Default::default(),
@@ -209,6 +221,7 @@ impl Message {
             from_id: quote.author_uuid?.parse().ok()?,
             message: quote.text,
             arrived_at: quote.id?,
+            status: DeliveryStatus::RECEIVED,
             quote: None,
             attachments: Default::default(),
             reactions: Default::default(),
@@ -223,12 +236,13 @@ pub enum Event {
     Click(MouseEvent),
     Input(KeyEvent),
     Message(Content),
+    MessageUpdate(ChannelId, u64, DeliveryStatus),
     Resize { cols: u16, rows: u16 },
     Quit(Option<anyhow::Error>),
 }
 
 impl App {
-    pub async fn try_new(relink: bool) -> anyhow::Result<Self> {
+    pub async fn try_new(relink: bool, event_channel: Sender<Event>) -> anyhow::Result<Self> {
         let (signal_manager, config) = signal::ensure_linked_device(relink).await?;
 
         let mut load_data_path = config.data_path.clone();
@@ -265,6 +279,7 @@ impl App {
             data,
             should_quit: false,
             signal_manager,
+            event_channel,
         })
     }
 
@@ -340,22 +355,28 @@ impl App {
             ..Default::default()
         };
 
+        let tx = self.event_channel.clone();
+        let channel_id = channel.id.clone();
         match channel.id {
             ChannelId::User(uuid) => {
                 let manager = self.signal_manager.clone();
                 let body = ContentBody::DataMessage(data_message);
                 tokio::task::spawn_local(async move {
-                    if let Err(e) = manager.send_message(uuid, body, timestamp).await {
-                        // TODO: Proper error handling
-                        log::error!("Failed to send message to {}: {}", uuid, e);
-                        return;
+                    let status = match manager.send_message(uuid, body, timestamp).await {
+                        Err(_) => DeliveryStatus::FAILED,
+                        _ => DeliveryStatus::DELIVERED,
+                    };
+                    if let Err(e) = tx
+                        .send(Event::MessageUpdate(channel_id, timestamp, status))
+                        .await
+                    {
+                        log::error!("Could not update message status: {:?}", e);
                     }
                 });
             }
             ChannelId::Group(_) => {
                 if let Some(group_data) = channel.group_data.as_ref() {
                     let manager = self.signal_manager.clone();
-                    let self_uuid = self.signal_manager.uuid();
 
                     data_message.group_v2 = Some(GroupContextV2 {
                         master_key: Some(group_data.master_key_bytes.to_vec()),
@@ -364,17 +385,23 @@ impl App {
                     });
 
                     let recipients = group_data.members.clone().into_iter();
+                    let self_uuid = self.signal_manager.uuid();
 
                     tokio::task::spawn_local(async move {
                         let recipients =
                             recipients.filter(|uuid| *uuid != self_uuid).map(Into::into);
-                        if let Err(e) = manager
+                        let status = match manager
                             .send_message_to_group(recipients, data_message, timestamp)
                             .await
                         {
-                            // TODO: Proper error handling
-                            log::error!("Failed to send group message: {}", e);
-                            return;
+                            Err(_) => DeliveryStatus::FAILED,
+                            _ => DeliveryStatus::DELIVERED,
+                        };
+                        if let Err(e) = tx
+                            .send(Event::MessageUpdate(channel_id, timestamp, status))
+                            .await
+                        {
+                            log::error!("Could not update message status: {:?}", e);
                         }
                     });
                 } else {
@@ -388,6 +415,7 @@ impl App {
             message: Some(message),
             arrived_at: timestamp,
             quote: quote_message,
+            status: DeliveryStatus::SENT,
             attachments: Default::default(),
             reactions: Default::default(),
         });
@@ -558,7 +586,7 @@ impl App {
                 }),
             ) if destination_uuid.parse() == Ok(self_uuid) => {
                 let channel_idx = self.ensure_own_channel_exists();
-                let message = Message::new(self_uuid, text, timestamp);
+                let message = Message::new_received(self_uuid, text, timestamp);
                 (channel_idx, message)
             }
             // Direct/group message by us from a different device
@@ -616,7 +644,7 @@ impl App {
                 let quote = quote.and_then(Message::from_quote).map(Box::new);
                 let message = Message {
                     quote,
-                    ..Message::new(self_uuid, text, timestamp)
+                    ..Message::new_received(self_uuid, text, timestamp)
                 };
                 (channel_idx, message)
             }
@@ -677,7 +705,7 @@ impl App {
                 let quote = quote.and_then(Message::from_quote).map(Box::new);
                 let message = Message {
                     quote,
-                    ..Message::new(uuid, text, timestamp)
+                    ..Message::new_received(uuid, text, timestamp)
                 };
                 (channel_idx, message)
             }
@@ -787,6 +815,38 @@ impl App {
         self.add_message_to_channel(channel_idx, message);
 
         Ok(())
+    }
+
+    pub fn on_update_message(
+        &mut self,
+        channel_id: &ChannelId,
+        timestamp: u64,
+        delivery_status: DeliveryStatus,
+    ) {
+        log::debug!("Updating status of message {:}", timestamp);
+
+        if let Some(channel) = self
+            .data
+            .channels
+            .items
+            .iter_mut()
+            .find(|c| c.id == *channel_id)
+        {
+            let self_uuid = self.signal_manager.uuid();
+            if let Some(message) = channel
+                .messages
+                .items
+                .iter_mut()
+                .find(|m| m.arrived_at == timestamp && m.from_id == self_uuid)
+            {
+                message.status = delivery_status;
+                self.save().unwrap();
+            } else {
+                log::warn!("Could not find message to update {:}", timestamp);
+            }
+        } else {
+            log::warn!("Could not find channel to update message {:}", timestamp);
+        }
     }
 
     fn handle_reaction(

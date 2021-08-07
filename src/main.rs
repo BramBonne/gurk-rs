@@ -76,7 +76,8 @@ async fn is_online() -> bool {
 }
 
 async fn run_single_threaded(relink: bool) -> anyhow::Result<()> {
-    let mut app = App::try_new(relink).await?;
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(100);
+    let mut app = App::try_new(relink, tx.clone()).await?;
 
     enable_raw_mode()?;
     let _raw_mode_guard = scopeguard::guard((), |_| {
@@ -86,7 +87,6 @@ async fn run_single_threaded(relink: bool) -> anyhow::Result<()> {
     let mut stdout = std::io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
 
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(100);
     tokio::spawn({
         let tx = tx.clone();
         async move {
@@ -273,6 +273,9 @@ async fn run_single_threaded(relink: bool) -> anyhow::Result<()> {
                 if let Err(e) = app.on_message(content).await {
                     error!("failed on incoming message: {}", e);
                 }
+            },
+            Some(Event::MessageUpdate(channel_id, timestamp, delivery_status)) => {
+                app.on_update_message(&channel_id, timestamp, delivery_status);
             }
             Some(Event::Resize { .. }) | Some(Event::Redraw) => {
                 // will just redraw the app

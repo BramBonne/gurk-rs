@@ -332,16 +332,25 @@ fn display_message(
         lines = quote_lines;
     }
 
+    let delivery_status = match msg.status {
+        app::DeliveryStatus::RECEIVED => "",
+        app::DeliveryStatus::DELIVERED => "✓",
+        app::DeliveryStatus::FAILED => "×",
+        app::DeliveryStatus::SENT => "…",
+    };
+
     let mut spans: Vec<Spans> = lines
         .into_iter()
         .enumerate()
         .map(|(idx, line)| {
             let res = if idx == 0 {
+                let right_padding = width.saturating_sub(line.width() + 1);
                 vec![
                     time.clone(),
                     from.clone(),
                     delimeter.clone(),
                     Span::from(line.strip_prefix(prefix).unwrap().to_string()),
+                    Span::from(textwrap::indent(delivery_status, &" ".repeat(right_padding))),
                 ]
             } else {
                 vec![Span::from(line.to_string())]
